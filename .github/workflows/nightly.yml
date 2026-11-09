@@ -1,0 +1,60 @@
+name: Nightly
+
+# Triggers a COPR build of Ghostty's tip when upstream has a new commit.
+# COPR does the actual work: it runs copr/sources.sh, which fetches and
+# verifies the tip tarball and turns ghostty-nightly.spec into a buildable spec.
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # daily, after upstream's tip release usually lands
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if this tip commit is already built"
+        type: boolean
+        default: false
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  copr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for a new tip commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          # commits/tip resolves the annotated tag to its commit.
+          sha=$(gh api repos/ghostty-org/ghostty/commits/tip --jq .sha | cut -c1-7)
+          echo "Upstream tip: $sha"
+
+          pkg=$(curl -fsS 'https://copr.fedorainfracloud.org/api_3/package?ownername=ibanks&projectname=ghostty-nightly&packagename=ghostty-nightly&with_latest_build=true&with_latest_succeeded_build=true')
+          built=$(jq -r '.builds.latest_succeeded.source_package.version // ""' <<<"$pkg")
+          latest_state=$(jq -r '.builds.latest.state // ""' <<<"$pkg")
+          echo "COPR: latest succeeded ${built:-none}, latest build state ${latest_state:-none}"
+
+          if [[ $FORCE == true ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          elif [[ $built == *".git$sha" ]]; then
+            echo "Tip $sha is already built."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [[ $latest_state =~ ^(pending|waiting|importing|starting|running)$ ]]; then
+            echo "A COPR build is already in progress."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger COPR build
+        if: steps.check.outputs.build == 'true'
+        env:
+          # Custom webhook URL (never expires, unlike the COPR API token).
+          COPR_WEBHOOK_URL: ${{ secrets.COPR_WEBHOOK_URL }}
+        run: curl -fsS -X POST "$COPR_WEBHOOK_URL"
